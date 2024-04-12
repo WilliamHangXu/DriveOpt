@@ -1,22 +1,43 @@
+"""
+The main function of the project.
+
+# Arguments
+- `rng`: Random number generator. By changing the seed, we get a different lane layout.
+- `sim_step`: Number of steps to simulate.
+- `timestep`: timestep
+- `traj_length`: the number of steps to generate for future trajectory.
+- `lane_width`: width of lane
+- `lane_length`: length of lane
+- `num_obstacles`: number of obstacles on the lane
+- `num_resources`: number of resources on the lane
+- `min_r`: minimum radius of obstacles
+- `max_r`: maximum radius of obstacles
+- `max_vel`: maximum velocity
+"""
 function simulate(;
         rng = MersenneTwister(6),
         sim_steps = 63, 
         timestep = 0.2, 
         traj_length = 20,
-        R = Diagonal([0.0, 0.01]),
-        lane_width = 20, 
+        lane_width = 30, 
         lane_length = 120, 
-        num_obstacles = 10, 
-        num_resources = 3,
+        num_obstacles = 20, 
+        num_resources = 5,
         min_r = 0.3, 
         max_r = 2.5, 
         max_vel = 12)
+
+    # This array stores simulation records.
     sim_records = []
+
+    # Defines half spaces representing the lane
     a¹ = [0; 1]; b¹ = -lane_width / 2.0
     a² = [0; -1]; b² = -lane_width / 2.0
 
+    # Initialize car state
     car = (; state=[0.0, 0.0, 0.0, 0.0], r=1.0)
 
+    # Generate obstacles and resources. Make sure they do not collide with each other.
     objects = [generate_object(rng, car.r, lane_width, lane_length, min_r, max_r),]
     while length(objects) < num_obstacles + num_resources
         obj = generate_object(rng, car.r, lane_width, lane_length, min_r, max_r)
@@ -29,31 +50,45 @@ function simulate(;
     obstacles = objects[1:num_obstacles]
     resources = objects[num_obstacles+1:num_obstacles+num_resources]
 
-    # @showprogress while lane_length - car.state[1] > 0.0
     @showprogress for t = 1:sim_steps
-        # println(t)
 
+        # Get visible obstacles and objects.
         vis_obstacles = get_visible(car, obstacles, lane_width)
         vis_resources = get_visible(car, resources, lane_width)
-        # println(length(vis_obstacles))
-        # println(length(vis_resources))
         
-        callbacks = create_callback_generator(length(vis_obstacles), length(vis_resources), traj_length, timestep, R, max_vel)
+        # Generate symbolic functions for the IPOPT solver.
+        callbacks = create_callback_generator(length(vis_obstacles), length(vis_resources), traj_length, timestep, max_vel)
         
+        # Generate trajectory
         trajectory = generate_trajectory(car, vis_obstacles, vis_resources, a¹, b¹, a², b², callbacks, traj_length)  
 
+        # Record simulation information, including car state, trajectory, visible obstacles and visible resources
         push!(sim_records, (; car=car, trajectory, vis_obstacles, vis_resources))
 
+        # Move the car to the next step.
         car = (; state = trajectory.states[1], r=car.r)
         
     end
-    # for (e, i) in enumerate(sim_records)
-    #     println(e)    
-    #     println(i.car.state)
-    # end
+
+    # Visualize the simulation process
     visualize_simulation(sim_records, obstacles, resources, a¹, b¹, a², b²,lane_length)
 end
 
+"""
+    generate_object(rng, car_r, lane_width, lane_length, min_r, max_r)
+Generate an object on the lane and make sure that it is not too close to the starting line and the
+end line.
+# Arguments
+- `rng`: random number generator
+- `car_r`: the radius of the car
+- `lane_width`: width of lane
+- `lane_length`: length of lane
+- `min_r`: minimum radius of obstacles
+- `max_r`: maximum radius of obstacles
+
+# Returns
+The state of the object.
+"""
 function generate_object(rng, car_r, lane_width, lane_length, min_r, max_r)
     r = min_r + rand(rng) * (max_r - min_r)
     x = 2 * car_r + r + rand(rng)*(lane_length - 4 * car_r - 2 * r)
@@ -61,6 +96,23 @@ function generate_object(rng, car_r, lane_width, lane_length, min_r, max_r)
     (; state=[x,y], r)
 end
 
+
+"""
+    generate_trajectory(car, vis_obstacles, vis_resources, a¹, b¹, a², b², callbacks, trajectory_length)
+
+Generate a trajectory for the car.
+
+# Arguments
+- `car`: state of the car
+- `vis_obstacles`: a list of visible obstacles
+- `vis_resources`: a list of visible resources
+- `a¹, b¹, a², b²`: parameters defining two half spaces representing the lane
+- `callbacks`: the symbolic functions and constraint boundaries for the IPOPT solver
+- `traj_length`: length of the trajectory
+
+# Returns
+The generated trajectory. States and Controls.
+"""
 function generate_trajectory(car, vis_obstacles, vis_resources, a¹, b¹, a², b², callbacks, trajectory_length)
     state = car.state
     r = car.r
@@ -80,6 +132,7 @@ function generate_trajectory(car, vis_obstacles, vis_resources, a¹, b¹, a², b
         res_r = [0]
     end
 
+    # Turn the symbolic functions into functions using real values.
     wrapper_f = function(z)
         callbacks.full_cost_fn(z, state, r, obs_states, obs_r, res_states, res_r, a¹, b¹, a², b²)
     end
@@ -110,6 +163,7 @@ function generate_trajectory(car, vis_obstacles, vis_resources, a¹, b¹, a², b
         nothing
     end
     
+    # Uses the IPOPT solver to generate trajectory.
     n = trajectory_length * 6
     m = length(callbacks.constraints_lb)
     prob = Ipopt.CreateIpoptProblem(
@@ -128,8 +182,8 @@ function generate_trajectory(car, vis_obstacles, vis_resources, a¹, b¹, a², b
         wrapper_lag_hess
     )
 
+    # Initial values.
     controls = repeat([zeros(2),], trajectory_length)
-    
     states = repeat([state,], trajectory_length)
     zinit = compose_trajectory(states, controls)
     prob.x = zinit
@@ -145,6 +199,10 @@ function generate_trajectory(car, vis_obstacles, vis_resources, a¹, b¹, a², b
     (; states, controls, status)
 end
 
+
+"""
+Given simulation data, visualize the simulation and generate a video.
+"""
 function visualize_simulation(sim_results, obstacles, resources, a1, b1, a2, b2, lane_length)
     f = Figure()
     ax = f[1,1] = Axis(f, aspect = DataAspect())
@@ -243,7 +301,7 @@ function visualize_simulation(sim_results, obstacles, resources, a1, b1, a2, b2,
     for res in res_circles
         poly!(ax, res, color = :red)
     end
-    record(f, "mpc_animation.gif", sim_results;
+    record(f, "simulation.mp4", sim_results;
         framerate = 20) do sim_step 
         for (t,state) in zip(traj, sim_step.trajectory.states)
             t[] = Point2f(state[1], state[2])
